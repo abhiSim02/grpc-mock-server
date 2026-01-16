@@ -15,4 +15,4 @@ RUN mkdir -p /app/logs
 EXPOSE 9090
 
 # Optional: small delay if it depends on other services; else you can drop "sleep 10 &&"
-CMD ["sh", "-c", "sleep 10 && java -jar grpc-mock-server.jar >> /app/logs/grpc-mock-server.log 2>&1"]
+CMD ["sh", "-c", "sleep 10 && java -jar grpc-mock-server.jar > /app/logs/grpc-mock-server.log 2>&1"]
