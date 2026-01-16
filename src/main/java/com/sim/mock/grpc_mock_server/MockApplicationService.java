@@ -24,27 +24,27 @@ public class MockApplicationService extends PlatformGrpc.PlatformImplBase {
     private static final Logger logger = LoggerFactory.getLogger(MockApplicationService.class);
     private static final ObjectMapper mapper = new ObjectMapper();
 
-    // Stats Container
     private static final ConcurrentHashMap<String, WorkflowStats> statsMap = new ConcurrentHashMap<>();
-
-    // Concurrency Tracking
     private static final AtomicInteger currentConcurrency = new AtomicInteger(0);
-    private static final AtomicInteger peakConcurrencyWindow = new AtomicInteger(0); // Peak in last 5s
+    private static final AtomicInteger peakConcurrencyWindow = new AtomicInteger(0);
 
     private ExecutorService requestProcessor;
     private ScheduledExecutorService monitorService;
+    private boolean wasActiveLastRun = false; // To track state changes
 
     @Value("${mock.server.threads:10}")
     private int threadCount;
 
+    @Value("${mock.server.report.interval:10}") // Configurable interval, default 10s
+    private int reportInterval;
+
     @PostConstruct
     public void init() {
-        logger.info("Initializing Mock Server with {} worker threads.", threadCount);
+        logger.info("Initializing Mock Server with {} threads. Report Interval: {}s", threadCount, reportInterval);
         this.requestProcessor = Executors.newFixedThreadPool(threadCount);
 
-        // Start the Monitoring Reporter (Runs every 5 seconds)
         this.monitorService = Executors.newSingleThreadScheduledExecutor();
-        this.monitorService.scheduleAtFixedRate(this::printReport, 5, 5, TimeUnit.SECONDS);
+        this.monitorService.scheduleAtFixedRate(this::printReport, reportInterval, reportInterval, TimeUnit.SECONDS);
     }
 
     @PreDestroy
@@ -55,9 +55,7 @@ public class MockApplicationService extends PlatformGrpc.PlatformImplBase {
 
     @Override
     public void platformExecution(PlatformRequest request, StreamObserver<PlatformResponse> responseObserver) {
-        // Track Start
         int active = currentConcurrency.incrementAndGet();
-        // Update peak if higher
         peakConcurrencyWindow.getAndUpdate(current -> Math.max(current, active));
 
         requestProcessor.submit(() -> {
@@ -67,7 +65,6 @@ public class MockApplicationService extends PlatformGrpc.PlatformImplBase {
                 logger.error("Error processing request", e);
                 responseObserver.onError(e);
             } finally {
-                // Track End
                 currentConcurrency.decrementAndGet();
             }
         });
@@ -80,90 +77,100 @@ public class MockApplicationService extends PlatformGrpc.PlatformImplBase {
 
         try {
             JsonNode rootNode = mapper.readTree(payload);
-
             if (rootNode.isObject()) {
-                if (rootNode.has("workflowId")) {
-                    identifier = rootNode.get("workflowId").asText();
-                } else if (rootNode.has("batchId")) {
-                    identifier = rootNode.get("batchId").asText().split("-")[0];
-                }
+                if (rootNode.has("workflowId")) identifier = rootNode.get("workflowId").asText();
+                else if (rootNode.has("batchId")) identifier = rootNode.get("batchId").asText().split("-")[0];
                 recordCount = 1;
-
                 statsMap.putIfAbsent(identifier, new WorkflowStats());
                 statsMap.get(identifier).add(1, recordCount);
-
             } else if (rootNode.isArray()) {
                 recordCount = rootNode.size();
                 identifier = "Bulk_Array";
                 statsMap.putIfAbsent(identifier, new WorkflowStats());
                 statsMap.get(identifier).add(1, recordCount);
             }
-
         } catch (Exception e) {
-            logger.error("Failed to parse payload: {}", e.getMessage());
+            logger.error("Payload parse error: {}", e.getMessage());
         }
 
-        String jsonResponse = String.format("{\"status\": \"SUCCESS\", \"id\": \"%s\", \"count\": %d}", identifier, recordCount);
+        String jsonResponse = String.format("{\"status\":\"SUCCESS\",\"id\":\"%s\",\"count\":%d}", identifier, recordCount);
         PlatformResponse response = PlatformResponse.newBuilder().setResult(jsonResponse).build();
         responseObserver.onNext(response);
         responseObserver.onCompleted();
     }
 
-    // --- REPORTING LOGIC ---
+    // --- OPTIMIZED REPORTING ---
     private void printReport() {
         if (statsMap.isEmpty()) return;
 
+        boolean anyActivity = false;
+        long now = System.currentTimeMillis();
         StringBuilder sb = new StringBuilder();
-        sb.append("\n==================== MOCK SERVER LIVE MONITOR (Last 5s) ====================\n");
-        sb.append(String.format("| %-25s | %-10s | %-12s | %-10s | %-10s |\n", "WORKFLOW ID", "TOT.BATCH", "TOT. RECS", "CURR REC/S", "AVG REC/S"));
-        sb.append("|---------------------------|------------|--------------|------------|------------|\n");
 
+        // Calculate totals first to see if we need to print
         long grandTotalRecords = 0;
         long grandTotalBatches = 0;
+        long grandTotalSpeed = 0;
+
+        // First pass: Calculate and check for activity
+        for (WorkflowStats s : statsMap.values()) {
+            long totalRecs = s.totalRecords.get();
+            long deltaRecs = totalRecs - s.lastReportedRecords;
+            if (deltaRecs > 0) anyActivity = true;
+        }
+
+        // LOGIC: Only print if there is activity, OR if we just finished (transition from active to idle)
+        if (!anyActivity && !wasActiveLastRun) {
+            return; // Stay silent
+        }
+
+        sb.append("\n=== MOCK SERVER MONITOR (Last ").append(reportInterval).append("s) ===\n");
+        sb.append(String.format("| %-25s | %-10s | %-12s | %-10s | %-10s |\n", "WORKFLOW ID", "BATCHES", "RECORDS", "CURR/s", "AVG/s"));
+        sb.append("|---------------------------|------------|--------------|------------|------------|\n");
 
         for (Map.Entry<String, WorkflowStats> entry : statsMap.entrySet()) {
             String wf = entry.getKey();
             WorkflowStats s = entry.getValue();
 
-            long now = System.currentTimeMillis();
             long totalRecs = s.totalRecords.get();
             long totalBatches = s.totalBatches.get();
-
-            // Add to Grand Total
             grandTotalRecords += totalRecs;
             grandTotalBatches += totalBatches;
 
-            // Calculate Current Speed (Sliding Window)
+            // Speed calculations
             long deltaRecs = totalRecs - s.lastReportedRecords;
             long deltaSec = (now - s.lastReportTime) / 1000;
             if (deltaSec == 0) deltaSec = 1;
             long currentRate = deltaRecs / deltaSec;
+            grandTotalSpeed += currentRate;
 
-            // Calculate Overall Average
-            long totalDurationSec = (now - s.startTime) / 1000;
-            if (totalDurationSec == 0) totalDurationSec = 1;
-            long avgRate = totalRecs / totalDurationSec;
+            long durationSec = (now - s.startTime) / 1000;
+            if (durationSec == 0) durationSec = 1;
+            long avgRate = totalRecs / durationSec;
 
             sb.append(String.format("| %-25s | %-10d | %-12d | %-10d | %-10d |\n",
                     truncate(wf, 25), totalBatches, totalRecs, currentRate, avgRate));
 
-            // Update snapshot for next run
+            // Update state
             s.lastReportedRecords = totalRecs;
             s.lastReportTime = now;
         }
-        sb.append("|---------------------------|------------|--------------|------------|------------|\n");
 
-        // --- NEW: Grand Total Line ---
-        sb.append(String.format("| %-25s | %-10d | %-12d | %-10s | %-10s |\n",
-                "** GRAND TOTAL **", grandTotalBatches, grandTotalRecords, "-", "-"));
         sb.append("|---------------------------|------------|--------------|------------|------------|\n");
+        sb.append(String.format("| %-25s | %-10d | %-12d | %-10d | %-10s |\n",
+                "** TOTAL **", grandTotalBatches, grandTotalRecords, grandTotalSpeed, "-"));
 
-        int peak = peakConcurrencyWindow.getAndSet(0); // Reset peak for next window
-        sb.append(String.format(" CONCURRENCY: Current=%d | Peak(Last 5s)=%d | MaxThreads=%d\n",
+        int peak = peakConcurrencyWindow.getAndSet(0);
+        sb.append(String.format(" THREADS: Active=%d | Peak=%d | Pool=%d\n",
                 currentConcurrency.get(), peak, threadCount));
-        sb.append("==============================================================================\n");
+
+        if (!anyActivity && wasActiveLastRun) {
+            sb.append(" [STATUS: IDLE - Processing Complete]\n");
+        }
+        sb.append("============================================================================\n");
 
         logger.info(sb.toString());
+        wasActiveLastRun = anyActivity;
     }
 
     private String truncate(String s, int len) {
@@ -171,13 +178,10 @@ public class MockApplicationService extends PlatformGrpc.PlatformImplBase {
         return s.substring(0, len-3) + "...";
     }
 
-    // --- Stats Inner Class ---
     private static class WorkflowStats {
         final AtomicLong totalBatches = new AtomicLong(0);
         final AtomicLong totalRecords = new AtomicLong(0);
         final long startTime = System.currentTimeMillis();
-
-        // For sliding window calculation
         long lastReportedRecords = 0;
         long lastReportTime = System.currentTimeMillis();
 
