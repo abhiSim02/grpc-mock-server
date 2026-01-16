@@ -5,14 +5,19 @@ package com.sim.spriced.platform.grpc.generated;
 option java_package = "com.sim.spriced.platform.grpc.generated";
 option java_multiple_files = true;
 
-service ApplicationService {
-    rpc BusinessExecution (ApplicationRequest) returns (ApplicationResponse);
+// CHANGED: Service name from ApplicationService to Platform
+service Platform {
+    // CHANGED: Method name from BusinessExecution to PlatformExecution
+    rpc PlatformExecution (PlatformRequest) returns (PlatformResponse);
 }
 
-message ApplicationRequest {
+// You likely need to rename these messages too,
+// OR check what the client is actually sending.
+// Assuming client sends PlatformRequest/PlatformResponse:
+message PlatformRequest {
     string payload = 1;
 }
 
-message ApplicationResponse {
+message PlatformResponse {
     string result = 1;
 }
